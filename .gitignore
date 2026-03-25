@@ -1,0 +1,12 @@
+#Python
+__pycache__/
+*.pyc
+
+#Virtual Environment
+.venv/
+
+#DVC Cache
+.dvc/cache/
+
+birdclef-2026/
+processed_data/
