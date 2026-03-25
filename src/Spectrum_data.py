@@ -3,39 +3,47 @@ import numpy as np
 import pandas as pd
 import librosa
 from tqdm import tqdm
+import ast
 
 # ==============================
 # CONFIG
 # ==============================
 BASE_AUDIO_PATH = "birdclef-2026/train_soundscapes/"
+CSV_PATH = "birdclef-2026/train_soundscapes_labels.csv"
+
 SAVE_DIR = "processed_data/spectrograms"
 METADATA_PATH = "processed_data/metadata.csv"
 
-SEGMENT_DURATION = 5
-MAX_SAMPLES = 100000  # change later → resume automatically
+MAX_SAMPLES = 100000
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 os.makedirs("processed_data", exist_ok=True)
 
 # ==============================
-# LOAD EXISTING STATE
+# LOAD CSV
+# ==============================
+df = pd.read_csv(CSV_PATH)
+
+df["start_sec"] = pd.to_timedelta(df["start"]).dt.total_seconds()
+df["end_sec"] = pd.to_timedelta(df["end"]).dt.total_seconds()
+
+# ==============================
+# RESUME
 # ==============================
 def get_existing_state():
     existing_files = os.listdir(SAVE_DIR)
 
     if len(existing_files) == 0:
-        return 0, set()
+        return 0
 
     indices = [int(f.split(".")[0]) for f in existing_files if f.endswith(".npy")]
     max_index = max(indices)
 
-    print(f"🔁 Resuming from sample: {max_index + 1}")
-
-    return max_index + 1, set(indices)
-
+    print(f"🔁 Resuming from {max_index + 1}")
+    return max_index + 1
 
 # ==============================
-# SPECTROGRAM FUNCTION
+# SPECTROGRAM
 # ==============================
 def create_spectrogram(audio, sr, start_sec, end_sec):
     start_sample = int(start_sec * sr)
@@ -59,21 +67,17 @@ def create_spectrogram(audio, sr, start_sec, end_sec):
 
     return np.expand_dims(mel_db, axis=-1).astype(np.float32)
 
-
 # ==============================
-# MAIN PROCESSING
+# PROCESS (CSV-DRIVEN)
 # ==============================
-def process_full_audio():
+def process_labeled():
     metadata = []
 
-    # 🔁 Resume support
-    file_counter, existing_indices = get_existing_state()
+    file_counter = get_existing_state()
 
-    files = sorted(os.listdir(BASE_AUDIO_PATH))
+    grouped = df.groupby("filename")
 
-    print(f"🚀 Processing {len(files)} audio files...")
-
-    for filename in tqdm(files):
+    for filename, group in tqdm(grouped):
         if file_counter >= MAX_SAMPLES:
             break
 
@@ -81,22 +85,16 @@ def process_full_audio():
             filepath = os.path.join(BASE_AUDIO_PATH, filename)
             audio, sr = librosa.load(filepath, sr=32000)
 
-            total_duration = len(audio) / sr
-            num_segments = int(total_duration // SEGMENT_DURATION)
-
-            for i in range(num_segments):
+            for _, row in group.iterrows():
                 if file_counter >= MAX_SAMPLES:
                     break
 
-                # Skip already processed index
-                if file_counter in existing_indices:
-                    file_counter += 1
-                    continue
-
-                start = i * SEGMENT_DURATION
-                end = start + SEGMENT_DURATION
-
-                spec = create_spectrogram(audio, sr, start, end)
+                spec = create_spectrogram(
+                    audio,
+                    sr,
+                    row["start_sec"],
+                    row["end_sec"]
+                )
 
                 if spec is None:
                     continue
@@ -106,11 +104,12 @@ def process_full_audio():
 
                 np.save(save_path, spec, allow_pickle=False)
 
+                # ✅ FIX: add labels
+                label = ast.literal_eval(row["label_vector"])
+
                 metadata.append({
                     "file": file_id,
-                    "filename": filename,
-                    "start": start,
-                    "end": end
+                    "labels": label
                 })
 
                 file_counter += 1
@@ -120,20 +119,18 @@ def process_full_audio():
 
     return pd.DataFrame(metadata)
 
-
 # ==============================
 # RUN
 # ==============================
 if __name__ == "__main__":
-    new_metadata = process_full_audio()
+    new_metadata = process_labeled()
 
-    # 🔁 Append metadata instead of overwrite
     if os.path.exists(METADATA_PATH):
-        old_metadata = pd.read_csv(METADATA_PATH)
-        final_metadata = pd.concat([old_metadata, new_metadata], ignore_index=True)
+        old = pd.read_csv(METADATA_PATH)
+        final = pd.concat([old, new_metadata], ignore_index=True)
     else:
-        final_metadata = new_metadata
+        final = new_metadata
 
-    final_metadata.to_csv(METADATA_PATH, index=False)
+    final.to_csv(METADATA_PATH, index=False)
 
-    print(f"✅ Total samples now: {len(final_metadata)}")
+    print(f"✅ Total samples: {len(final)}")
