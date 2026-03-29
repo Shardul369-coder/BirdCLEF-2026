@@ -1,0 +1,5 @@
+Model:
+  EPOCHS: 100     
+  BATCH_SIZE: 16              
+  LEARNING_RATE: 1e-4
+  NUM_CLASSES: 264
