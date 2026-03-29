@@ -1,0 +1,18 @@
+stages:
+    train:
+    cmd: PYTHONPATH=. python3.11 src/Model_seg.py
+    deps:
+      - src/Model_seg.py
+      - src/dataset_loader.py
+      - src/losses.py
+      - processed_data/train_paths.npy
+      - processed_data/train_labels.npy
+      - processed_data/val_paths.npy
+      - processed_data/val_labels.npy
+      - params.yaml
+    params:
+      - model
+    outs:
+      - checkpoints/seg_best.h5
+    metrics:
+      - metrics.json
