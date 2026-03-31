@@ -3,7 +3,6 @@ import numpy as np
 import pandas as pd
 import librosa
 from tqdm import tqdm
-import ast
 from sklearn.model_selection import train_test_split
 
 # ==============================
@@ -19,7 +18,9 @@ MAX_SAMPLES = 100000
 TARGET_TIME = 500
 
 WINDOW_SEC = 5
-STRIDE_SEC = 2
+STRIDE_SEC = 1
+
+EMPTY_KEEP_PROB = 0.3  # keep 30% empty windows
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 os.makedirs("processed_data", exist_ok=True)
@@ -32,21 +33,26 @@ df = pd.read_csv(CSV_PATH)
 df["start_sec"] = pd.to_timedelta(df["start"]).dt.total_seconds()
 df["end_sec"] = pd.to_timedelta(df["end"]).dt.total_seconds()
 
-df = df.sample(frac=1, random_state=42).reset_index(drop=True)
-
 print(f"📊 Total labeled segments: {len(df)}")
 
 # ==============================
-# RESUME
+# LABEL ENCODING
+# ==============================
+label_list = sorted(df["primary_label"].unique())
+label_map = {label: i for i, label in enumerate(label_list)}
+
+print(f"🐦 Total classes: {len(label_list)}")
+
+# ==============================
+# RESUME SUPPORT
 # ==============================
 def get_existing_state():
-    existing_files = [f for f in os.listdir(SAVE_DIR) if f.endswith(".npy")]
-
-    if not existing_files:
+    files = [f for f in os.listdir(SAVE_DIR) if f.endswith(".npy")]
+    if not files:
         return 0
 
     indices = []
-    for f in existing_files:
+    for f in files:
         try:
             indices.append(int(f.split(".")[0]))
         except:
@@ -59,14 +65,9 @@ def get_existing_state():
 # WINDOW GENERATION
 # ==============================
 def generate_windows(audio, sr):
-    windows = []
     total_sec = len(audio) / sr
-
     for start in np.arange(0, total_sec - WINDOW_SEC, STRIDE_SEC):
-        end = start + WINDOW_SEC
-        windows.append((start, end))
-
-    return windows
+        yield start, start + WINDOW_SEC
 
 
 # ==============================
@@ -77,7 +78,6 @@ def create_spectrogram(audio, sr, start_sec, end_sec):
     end_sample = int(end_sec * sr)
 
     segment = audio[start_sample:end_sample]
-
     if len(segment) == 0:
         return None
 
@@ -106,12 +106,15 @@ def create_spectrogram(audio, sr, start_sec, end_sec):
 # ==============================
 # LABEL GENERATION
 # ==============================
-def get_window_label(group, start_sec, end_sec, label_len):
-    labels = np.zeros(label_len)
+def get_window_label(group, start_sec, end_sec):
+    labels = np.zeros(len(label_map))
+
+    if len(group) == 0:
+        return labels
 
     for _, row in group.iterrows():
         if not (end_sec < row["start_sec"] or start_sec > row["end_sec"]):
-            labels = np.maximum(labels, ast.literal_eval(row["label_vector"]))
+            labels[label_map[row["primary_label"]]] = 1
 
     return labels
 
@@ -123,9 +126,9 @@ def process_data():
     metadata = []
     file_counter = get_existing_state()
 
-    grouped = df.groupby("filename")
+    all_files = os.listdir(BASE_AUDIO_PATH)
 
-    for filename, group in tqdm(grouped):
+    for filename in tqdm(all_files):
 
         if file_counter >= MAX_SAMPLES:
             break
@@ -134,25 +137,27 @@ def process_data():
             filepath = os.path.join(BASE_AUDIO_PATH, filename)
             audio, sr = librosa.load(filepath, sr=32000)
 
-            # 🔥 Optional augmentation
+            group = df[df["filename"] == filename]
+
+            # optional augmentation
             if np.random.rand() < 0.3:
                 audio = librosa.effects.time_stretch(audio, rate=1.1)
 
-            windows = generate_windows(audio, sr)
-
-            label_len = len(ast.literal_eval(group.iloc[0]["label_vector"]))
-
-            for start_sec, end_sec in windows:
+            for start_sec, end_sec in generate_windows(audio, sr):
 
                 if file_counter >= MAX_SAMPLES:
                     break
 
                 spec = create_spectrogram(audio, sr, start_sec, end_sec)
-
                 if spec is None:
                     continue
 
-                labels = get_window_label(group, start_sec, end_sec, label_len)
+                labels = get_window_label(group, start_sec, end_sec)
+
+                # handle empty windows
+                if labels.sum() == 0:
+                    if np.random.rand() > EMPTY_KEEP_PROB:
+                        continue
 
                 file_id = f"{file_counter}.npy"
                 save_path = os.path.join(SAVE_DIR, file_id)
@@ -177,7 +182,6 @@ def process_data():
 # SPLIT DATASET
 # ==============================
 def split_dataset(metadata_df):
-
     unique_files = metadata_df["filename"].unique()
 
     train_files, val_files = train_test_split(
@@ -196,7 +200,6 @@ def split_dataset(metadata_df):
 # SAVE NUMPY ARRAYS
 # ==============================
 def save_numpy(df, prefix):
-
     paths = df["file"].apply(
         lambda x: os.path.join(SAVE_DIR, x)
     ).values
@@ -218,7 +221,11 @@ if __name__ == "__main__":
 
     new_metadata = process_data()
 
-    if os.path.exists(METADATA_PATH):
+    if len(new_metadata) == 0:
+        raise ValueError("❌ No samples generated — check paths or CSV")
+
+    # safe metadata load
+    if os.path.exists(METADATA_PATH) and os.path.getsize(METADATA_PATH) > 0:
         old = pd.read_csv(METADATA_PATH)
         final_metadata = pd.concat([old, new_metadata], ignore_index=True)
     else:
@@ -235,4 +242,4 @@ if __name__ == "__main__":
     save_numpy(train_df, "train")
     save_numpy(val_df, "val")
 
-    print("🎉 DONE — Your dataset is now model-ready!")
+    print("🎉 DONE — Dataset ready!")
