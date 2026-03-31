@@ -18,6 +18,9 @@ METADATA_PATH = "processed_data/metadata.csv"
 MAX_SAMPLES = 100000
 TARGET_TIME = 500
 
+WINDOW_SEC = 5
+STRIDE_SEC = 2
+
 os.makedirs(SAVE_DIR, exist_ok=True)
 os.makedirs("processed_data", exist_ok=True)
 
@@ -29,8 +32,9 @@ df = pd.read_csv(CSV_PATH)
 df["start_sec"] = pd.to_timedelta(df["start"]).dt.total_seconds()
 df["end_sec"] = pd.to_timedelta(df["end"]).dt.total_seconds()
 
-# 🔥 Shuffle to avoid bias
 df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+
+print(f"📊 Total labeled segments: {len(df)}")
 
 # ==============================
 # RESUME
@@ -48,12 +52,22 @@ def get_existing_state():
         except:
             continue
 
-    if not indices:
-        return 0
+    return max(indices) + 1 if indices else 0
 
-    max_index = max(indices)
-    print(f"🔁 Resuming from {max_index + 1}")
-    return max_index + 1
+
+# ==============================
+# WINDOW GENERATION
+# ==============================
+def generate_windows(audio, sr):
+    windows = []
+    total_sec = len(audio) / sr
+
+    for start in np.arange(0, total_sec - WINDOW_SEC, STRIDE_SEC):
+        end = start + WINDOW_SEC
+        windows.append((start, end))
+
+    return windows
+
 
 # ==============================
 # SPECTROGRAM
@@ -80,25 +94,39 @@ def create_spectrogram(audio, sr, start_sec, end_sec):
 
     mel_db = np.expand_dims(mel_db, axis=-1)
 
-    # FIX SHAPE
     if mel_db.shape[1] < TARGET_TIME:
         pad = TARGET_TIME - mel_db.shape[1]
-        mel_db = np.pad(mel_db, ((0,0),(0,pad),(0,0)))
+        mel_db = np.pad(mel_db, ((0, 0), (0, pad), (0, 0)))
     else:
         mel_db = mel_db[:, :TARGET_TIME, :]
 
     return mel_db.astype(np.float32)
 
+
 # ==============================
-# CREATE SPECTROGRAM DATA
+# LABEL GENERATION
 # ==============================
-def process_labeled():
+def get_window_label(group, start_sec, end_sec, label_len):
+    labels = np.zeros(label_len)
+
+    for _, row in group.iterrows():
+        if not (end_sec < row["start_sec"] or start_sec > row["end_sec"]):
+            labels = np.maximum(labels, ast.literal_eval(row["label_vector"]))
+
+    return labels
+
+
+# ==============================
+# MAIN PROCESSING
+# ==============================
+def process_data():
     metadata = []
     file_counter = get_existing_state()
 
     grouped = df.groupby("filename")
 
     for filename, group in tqdm(grouped):
+
         if file_counter >= MAX_SAMPLES:
             break
 
@@ -106,39 +134,44 @@ def process_labeled():
             filepath = os.path.join(BASE_AUDIO_PATH, filename)
             audio, sr = librosa.load(filepath, sr=32000)
 
-            for _, row in group.iterrows():
+            # 🔥 Optional augmentation
+            if np.random.rand() < 0.3:
+                audio = librosa.effects.time_stretch(audio, rate=1.1)
+
+            windows = generate_windows(audio, sr)
+
+            label_len = len(ast.literal_eval(group.iloc[0]["label_vector"]))
+
+            for start_sec, end_sec in windows:
+
                 if file_counter >= MAX_SAMPLES:
                     break
 
-                spec = create_spectrogram(
-                    audio,
-                    sr,
-                    row["start_sec"],
-                    row["end_sec"]
-                )
+                spec = create_spectrogram(audio, sr, start_sec, end_sec)
 
                 if spec is None:
                     continue
+
+                labels = get_window_label(group, start_sec, end_sec, label_len)
 
                 file_id = f"{file_counter}.npy"
                 save_path = os.path.join(SAVE_DIR, file_id)
 
                 np.save(save_path, spec, allow_pickle=False)
 
-                label = ast.literal_eval(row["label_vector"])
-
                 metadata.append({
                     "file": file_id,
-                    "labels": label,
-                    "filename": filename   # 🔥 IMPORTANT
+                    "labels": labels.tolist(),
+                    "filename": filename
                 })
 
                 file_counter += 1
 
         except Exception as e:
-            print(f"⚠️ Error: {filename} -> {e}")
+            print(f"⚠️ Error processing {filename}: {e}")
 
     return pd.DataFrame(metadata)
+
 
 # ==============================
 # SPLIT DATASET
@@ -158,8 +191,9 @@ def split_dataset(metadata_df):
 
     return train_df, val_df
 
+
 # ==============================
-# SAVE NUMPY FILES
+# SAVE NUMPY ARRAYS
 # ==============================
 def save_numpy(df, prefix):
 
@@ -167,23 +201,22 @@ def save_numpy(df, prefix):
         lambda x: os.path.join(SAVE_DIR, x)
     ).values
 
-    labels = np.stack(
-        df["labels"].apply(ast.literal_eval).values
-    )
+    labels = np.stack(df["labels"].values)
 
     np.save(f"processed_data/{prefix}_paths.npy", paths)
     np.save(f"processed_data/{prefix}_labels.npy", labels)
 
     print(f"✅ Saved {prefix}: {len(paths)} samples")
 
+
 # ==============================
-# MAIN PIPELINE
+# MAIN
 # ==============================
 if __name__ == "__main__":
 
-    print("🚀 Starting preprocessing...")
+    print("🚀 Starting dataset generation...")
 
-    new_metadata = process_labeled()
+    new_metadata = process_data()
 
     if os.path.exists(METADATA_PATH):
         old = pd.read_csv(METADATA_PATH)
@@ -193,7 +226,7 @@ if __name__ == "__main__":
 
     final_metadata.to_csv(METADATA_PATH, index=False)
 
-    print(f"✅ Total samples: {len(final_metadata)}")
+    print(f"📦 Total samples: {len(final_metadata)}")
 
     print("🔀 Splitting dataset...")
     train_df, val_df = split_dataset(final_metadata)
@@ -202,4 +235,4 @@ if __name__ == "__main__":
     save_numpy(train_df, "train")
     save_numpy(val_df, "val")
 
-    print("🎉 Data pipeline complete!")
+    print("🎉 DONE — Your dataset is now model-ready!")
